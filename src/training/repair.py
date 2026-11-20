@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from src.otsl.grid import TOKENS, parse
 from scripts.ground_truth import sha, immutable, jbytes
+from scripts.training_reference import permits_machine_training, training_reference
 
 TAGS = ("<fcel>", "<ecel>", "<lcel>", "<ucel>", "<xcel>", "<nl>")
 PAD, BOS, EOS = 0, 1, 2
@@ -103,13 +104,9 @@ def samples(split, name, seed, limit):
     rng = random.Random(seed)
     pairs = []
     stats = Counter()
+    allow_machine = permits_machine_training(split)
     for row in read_split(split, name):
-        body = Path(row["gt"]).read_bytes()
-        if sha(body) != row["gt_sha256"]:
-            raise ValueError("GT hash mismatch")
-        gt = json.loads(body)
-        if gt.get("reviewer_type") != "human" or gt.get("decision") != "approve":
-            raise ValueError("Unapproved GT")
+        gt = training_reference(row, allow_machine)
         good = gt["corrected_otsl"]
         parse(good)
         synthetic, error = corrupt(good, rng)

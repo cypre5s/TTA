@@ -14,6 +14,7 @@ from scripts.freeze_pilot_repairs import verify_tree
 from scripts.ground_truth import immutable, jbytes, sha
 from scripts.repair_structures import repair
 from scripts.review import validator
+from scripts.training_reference import OCR_TIER, VISUAL_TIER
 from src.otsl.grid import parse
 
 OUT = EXP / "quality/records"
@@ -54,19 +55,17 @@ def glyphs(grid, tree=None):
     return "".join(parts)
 
 
-def audit(packet, response):
-    tid = packet.stem
-    m = json.loads(packet.read_bytes())
-    rev = json.loads(response.read_bytes())
-    validator.validate(rev)
-    if rev["table_id"] != tid or m["table_id"] != tid:
-        raise ValueError("Review binding")
+def evidence(packet):
+    packet_body = packet.read_bytes()
+    m = json.loads(packet_body)
     old = Path(m["prediction"])
-    raw = json.loads(old.read_bytes())
+    body = old.read_bytes()
+    raw = json.loads(body)
     image = Path(m["image"])
     if (
-        sha(image.read_bytes()) != m["image_sha256"]
-        or sha(old.read_bytes()) != m["prediction_sha256"]
+        m["table_id"] != packet.stem
+        or sha(image.read_bytes()) != m["image_sha256"]
+        or sha(body) != m["prediction_sha256"]
         or sha(Path(m["html"]).read_bytes()) != m["html_sha256"]
         or Path(m["raw_otsl"]).read_text() != raw["raw_otsl"]
     ):
@@ -78,8 +77,8 @@ def audit(packet, response):
         else EXP / "data"
     )
     pg = data_root / "rendered" / doc / (m["page_id"] + ".json")
-    rec = dict(
-        table_id=tid,
+    return m, raw, data_root, dict(
+        table_id=packet.stem,
         ordinal=m["ordinal"],
         document_sha256=doc,
         page_id=m["page_id"],
@@ -88,11 +87,40 @@ def audit(packet, response):
         image_sha256=m["image_sha256"],
         source_page=str(pg),
         bbox_px=m["bbox_px"],
-        review_sha256=sha(response.read_bytes()),
-        packet_sha256=sha(packet.read_bytes()),
+        packet_sha256=sha(packet_body),
         author="machine",
-        label_tier="visually_adjudicated_machine",
         human_approved=False,
+    )
+
+
+def screen(packet):
+    _, raw, _, rec = evidence(packet)
+    rec = dict(rec, label_tier=OCR_TIER, visual_quality=None, flags={}, visual_reviewed=False)
+    checks = raw.get("structure_checks", [])
+    try:
+        grid = parse(raw["raw_otsl"])
+    except ValueError as exc:
+        return dict(rec, decision="hold", reason=str(exc), flags={"structure_checks": checks})
+    if not compact(glyphs(grid)):
+        return dict(rec, decision="exclude", reason="No nonempty OCR cells")
+    if checks or grid.rows * grid.columns <= 1:
+        return dict(rec, decision="hold", reason="Structure requires visual review",
+                    flags={"structure_checks": checks or ["single_cell_crop"]})
+    return dict(rec, decision="usable", action="structure_screened_original",
+                corrected_otsl=raw["raw_otsl"], structure_tree=None, rows=grid.rows,
+                columns=grid.columns, content_signature=fingerprint(grid))
+
+
+def audit(packet, response):
+    tid = packet.stem
+    m, raw, data_root, rec = evidence(packet)
+    body = response.read_bytes()
+    rev = json.loads(body)
+    validator.validate(rev)
+    if rev["table_id"] != tid:
+        raise ValueError("Review binding")
+    rec = dict(
+        rec, review_sha256=sha(body), label_tier=VISUAL_TIER, visual_reviewed=True,
         decision="hold",
         visual_quality=rev["visual_quality"],
         flags={
@@ -178,7 +206,7 @@ def audit(packet, response):
                 rec, reason="Poor visual quality; verify legibility before inclusion"
             )
     if not compact(glyphs(grid, tree)):
-        return dict(rec, reason="Empty cell content")
+        return dict(rec, decision="exclude", reason="Empty cell content")
     return dict(
         rec,
         decision="usable",
@@ -191,25 +219,24 @@ def audit(packet, response):
     )
 
 
-def run():
+def run(structural_only=False):
     OUT.mkdir(parents=True, exist_ok=True)
-    for f in sorted(REV.glob("*.json")):
-        p = PACKETS / f.name
-        dest = OUT / f.name
-        if not p.exists():
-            raise ValueError("Missing packet")
-        fix = EXP / "annotation/visual_fixes" / f.name
+    sources = PACKETS if structural_only else REV
+    for path in sorted(sources.glob("*.json")):
+        p, f, dest = PACKETS / path.name, REV / path.name, OUT / path.name
+        has_review = f.is_file()
+        fix = EXP / "annotation/visual_fixes" / path.name
         if (
             dest.exists()
             and max(
-                f.stat().st_mtime,
+                f.stat().st_mtime if has_review else 0,
                 p.stat().st_mtime,
                 fix.stat().st_mtime if fix.exists() else 0,
             )
             <= dest.stat().st_mtime
         ):
             continue
-        result = audit(p, f)
+        result = audit(p, f) if has_review else screen(p)
         tmp = dest.with_suffix(".tmp")
         tmp.write_bytes(jbytes(result))
         tmp.replace(dest)
@@ -226,9 +253,10 @@ def run():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--structural-only", action="store_true")
     args = ap.parse_args()
     while True:
-        print(run(), flush=True)
+        print(run(args.structural_only), flush=True)
         if not args.watch:
             break
         time.sleep(25)

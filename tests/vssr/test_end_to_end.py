@@ -1,3 +1,5 @@
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -5,13 +7,18 @@ import unittest
 import torch
 from PIL import Image
 
+from scripts.train_vssr import loader, train_generation
 from scripts.vssr_smoke import fixture, reconstruction_fixture
 from src.training.vssr import VSSR1, VSSR3, upgrade
 from src.training.vssr.checkpoint import load_checkpoint, save_checkpoint
-from src.training.vssr.dataset import TableSample, VSSRDataset, collate
+from src.training.vssr.config import config_digest
+from src.training.vssr.dataset import TableSample, VSSRDataset, collate, reviewed_cell_targets
 from src.training.vssr.grid_reconstruction import reconstruct
 from src.training.vssr.losses import compute_losses
-from src.training.vssr.trainer import train_step
+from src.training.vssr.otsl_serializer import serialize_hierarchy
+from src.training.vssr.repair_pipeline import nested_graphs
+from src.training.vssr.trainer import batch_losses, train_step
+from src.otsl.grid import parse
 from test_modules import small_config
 from scripts.ground_truth import jbytes, sha
 
@@ -98,3 +105,109 @@ class ModelTests(unittest.TestCase):
             self.assertNotIn("nested", batch["targets"][1])
             self.assertEqual(batch["targets"][0]["anomaly"], 1)
             self.assertNotIn("anomaly", batch["targets"][1])
+    def test_nested_grandchild_coordinates_and_ocr_ownership(self):
+        def proposals(region):
+            return dict(nested_probability=torch.ones(1, 1), parent_cell_id=torch.zeros(1, 1, dtype=torch.long),
+                        child_table_region=torch.tensor([[region]]), child_boxes=torch.tensor([[[[0., 0., 1., 1.]]]]),
+                        child_cell_logits=torch.ones(1, 1, 1) * 9, child_type_logits=torch.ones(1, 1, 1, 4),
+                        child_relation_logits=torch.zeros(1, 1, 1, 1, 5), child_embeddings=torch.zeros(1, 1, 1, 32))
+
+        fragments = [dict(text="root", bbox=(.01, .01, .05, .05)),
+                     dict(text="child", bbox=(.15, .15, .19, .19)),
+                     dict(text="grandchild", bbox=(.43, .43, .46, .46))]
+        graph = reconstruct("root", torch.tensor([[0., 0., 1., 1.]]),
+                            torch.tensor([9.]), torch.ones(1, 4), fragments=fragments).graph
+
+        def descend(visual, parents):
+            self.assertEqual(tuple(parents.shape), (1, 1, 32))
+            return proposals((.4, .4, .7, .7))
+
+        _, warnings, used = nested_graphs(proposals((.1, .1, .9, .9)), 0, graph, fragments, .5,
+                                          next_level=descend, visual=torch.zeros(1, 3, 32))
+        result = serialize_hierarchy(graph)
+        self.assertFalse(warnings)
+        self.assertEqual(result["nesting_depth"], 2)
+        self.assertEqual(used, {1, 2})
+        child, grandchild = result["child_tables"]
+        self.assertEqual(result["relations"][1]["parent_table_id"], child["table_id"])
+        self.assertAlmostEqual(grandchild["bbox"][0], .42, places=6)
+        self.assertEqual([graph.cells[0].text, child["cells"][0]["text"], grandchild["cells"][0]["text"]],
+                         ["root", "child", "grandchild"])
+
+    def test_grandchild_supervision_runs_only_for_known_branches(self):
+        cfg = replace(small_config(), max_nesting_depth=2)
+        sample, _ = fixture(cfg)
+        child = sample.supervision["nested"][0]
+        child["nested"] = [dict(parent=0, bbox=(.03, .04, .25, .26), cells=[{"bbox": (.1, .1, .8, .8)}])]
+        calls = []
+        model = VSSR3(cfg).eval()
+        handle = model.hierarchy.decode.register_forward_hook(lambda _, args, output: calls.append(len(args[0])))
+        _, losses = batch_losses(model, collate([sample], cfg), bf16=False)
+        self.assertEqual(calls, [1, 1])
+        losses["hierarchy"].backward()
+        self.assertTrue(torch.isfinite(model.hierarchy.child_box.weight.grad).all())
+        del child["nested"]
+        calls.clear()
+        batch_losses(model, collate([sample], cfg))
+        self.assertEqual(calls, [1])
+        handle.remove()
+
+    def test_reviewed_tree_uses_the_parent_table_coordinate_frame(self):
+        def table(text, box, children):
+            return dict(otsl=f"<fcel>{text}<nl>", bbox_pt=box, cells=[
+                dict(row=0, column=0, rowspan=1, colspan=1, bbox_pt=box, children=children),
+            ])
+
+        tree = table("root", (0, 0, 100, 100), [
+            table("child", (10, 20, 90, 100), [table("grandchild", (30, 40, 70, 80), [])]),
+        ])
+        targets = reviewed_cell_targets(parse(tree["otsl"]), tree, lambda box: tuple(v / 100 for v in box))
+        child = targets["nested"][0]
+        self.assertEqual(child["bbox"], (.1, .2, .9, 1))
+        self.assertEqual(child["nested"][0]["bbox"], (.25, .25, .75, .75))
+        self.assertEqual(child["nested"][0]["cells"][0]["bbox"], (0, 0, 1, 1))
+
+    def test_old_checkpoints_preserve_depth_one(self):
+        cfg = small_config()
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.pt"
+            save_checkpoint(path, VSSR3(cfg))
+            payload = torch.load(path, weights_only=True)
+            del payload["config"]["max_nesting_depth"]
+            payload["config_sha256"] = config_digest(payload["config"])
+            torch.save(payload, path)
+            model, _ = load_checkpoint(path, expected_config=cfg)
+            self.assertEqual(model.config.max_nesting_depth, 1)
+
+    def test_batched_finite_checks_retain_losses_and_optimizer_update(self):
+        cfg = replace(small_config(), dropout=0.)
+        sample, _ = fixture(cfg)
+        batch = collate([sample], cfg)
+        before = VSSR3(cfg)
+        after = deepcopy(before)
+        reference = torch.optim.AdamW(before.parameters(), lr=1e-3)
+        optimized = torch.optim.AdamW(after.parameters(), lr=1e-3)
+        losses = compute_losses(before(batch), batch, cfg)
+        losses["total"].backward()
+        reference.step()
+        actual = train_step(after, batch, optimized)
+        self.assertEqual(actual, {name: float(value.detach()) for name, value in losses.items()})
+        for lhs, rhs in zip(before.parameters(), after.parameters(), strict=True):
+            self.assertTrue(torch.equal(lhs, rhs))
+
+    def test_training_stops_and_restores_the_best_epoch(self):
+        cfg = replace(small_config(), dropout=0.)
+        sample, _ = fixture(cfg)
+        device = torch.device("cpu")
+        batches = loader([sample], cfg, 1, 0, device)
+        model = VSSR1(cfg)
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "run"
+            unchanged, receipt = train_generation(
+                model, batches, batches, output, device, epochs=4, patience=2, min_delta=1e-4, lr=0., bf16=False,
+            )
+            self.assertTrue(receipt["stopped_early"])
+            self.assertEqual(receipt["epochs_run"], 2)
+            self.assertEqual(receipt["best_checkpoint"], "epoch-000.pt")
+            for lhs, rhs in zip(unchanged.parameters(), model.parameters(), strict=True):
+                self.assertTrue(torch.equal(lhs, rhs))

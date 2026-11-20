@@ -49,7 +49,7 @@ class CellProposal(nn.Module):
 
 
 @torch.no_grad()
-def hungarian(existence, boxes, labels, target_boxes, box_mask, target_types=None, type_mask=None):
+def hungarian(existence, boxes, labels, target_boxes, box_mask, target_types=None, type_mask=None, *, has_boxes=True):
     """Return prediction and target indices. Only annotated coordinates affect cost."""
     from scipy.optimize import linear_sum_assignment
 
@@ -57,9 +57,10 @@ def hungarian(existence, boxes, labels, target_boxes, box_mask, target_types=Non
     if labels is not None and target_types is not None:
         type_cost = -labels.float().softmax(-1)[:, target_types]
         cost += type_cost * type_mask[None] if type_mask is not None else type_cost
-    safe = torch.where(box_mask[:, None], target_boxes, 0).float()
-    bbox = torch.cdist(boxes.float(), safe, p=1)
-    _, giou = box_metrics(boxes.float()[:, None], safe[None])
-    cost += (5 * bbox - 2 * giou) * box_mask[None]
+    if has_boxes:
+        safe = torch.where(box_mask[:, None], target_boxes, 0).float()
+        bbox = torch.cdist(boxes.float(), safe, p=1)
+        _, giou = box_metrics(boxes.float()[:, None], safe[None])
+        cost += (5 * bbox - 2 * giou) * box_mask[None]
     i, j = linear_sum_assignment(cost.cpu().numpy())
     return torch.as_tensor(i, device=boxes.device), torch.as_tensor(j, device=boxes.device)

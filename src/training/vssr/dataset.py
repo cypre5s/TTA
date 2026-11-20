@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from scripts.ground_truth import sha
+from scripts.training_reference import OCR_TIER, permits_machine_training, training_reference
 from src.otsl.grid import parse
 from src.training.repair import encode
 from .geometry_encoder import BOX_SOURCES
@@ -95,33 +96,54 @@ def checked_json(path, expected):
     return json.loads(body)
 
 
-def crop_geometry(tree, page, packet):
-    """Convert independently reviewed PDF-cell coordinates to the crop frame."""
-    if not tree or not page or page.get("rotation", 0) != 0:
-        return {}
+def root_projection(page, packet):
+    if not page or page.get("rotation", 0) != 0:
+        return lambda _: None
     x0, y0, x1, y1 = packet["bbox_px"]
     scale = page["dpi"] / 72
-    boxes = {}
-    for c in tree["cells"]:
-        l, t, r, b = (v * scale for v in c["bbox_pt"])
-        coords = [(l - x0) / (x1 - x0), (t - y0) / (y1 - y0), (r - x0) / (x1 - x0), (b - y0) / (y1 - y0)]
-        u = tuple(max(0.0, min(1.0, v)) for v in coords)
-        if u[0] < u[2] and u[1] < u[3]:
-            boxes[(c["row"], c["column"], c["rowspan"], c["colspan"])] = u
-    return boxes
+    frame = tuple(v / scale for v in (x0, y0, x1, y1))
+    return lambda box: normalize_box(box, frame)
+
+
+def normalize_box(box, frame):
+    l, t, r, b = frame
+    coords = ((box[0] - l) / (r - l), (box[1] - t) / (b - t),
+              (box[2] - l) / (r - l), (box[3] - t) / (b - t))
+    bounded = tuple(max(0.0, min(1.0, v)) for v in coords)
+    return bounded if bounded[0] < bounded[2] and bounded[1] < bounded[3] else None
+
+
+def reviewed_cell_targets(grid, tree, project):
+    if tree is None:
+        return cell_targets(grid)
+    anchors = {(c.row, c.column, c.rowspan, c.colspan): i for i, c in enumerate(grid.cells)}
+    boxes, nested = {}, []
+    for cell in tree["cells"]:
+        anchor = tuple(cell[k] for k in ("row", "column", "rowspan", "colspan"))
+        boxes[anchor] = project(cell["bbox_pt"])
+        for child in cell["children"]:
+            frame = child["bbox_pt"]
+            targets = reviewed_cell_targets(parse(child["otsl"]), child, lambda box: normalize_box(box, frame))
+            nested.append(dict(targets, parent=anchors[anchor], bbox=project(frame)))
+    return dict(cell_targets(grid, boxes), nested=nested)
 
 
 class ReviewedPilot(Dataset):
-    """Adapter for frozen Pilot1k train only. Source and crop hashes stay bound."""
+    """Read frozen training/validation splits and the historical Pilot smoke cohort."""
 
-    def __init__(self, root, config, evidence=None):
+    def __init__(self, root, config, evidence=None, *, split="train", use_reference_boxes=True):
+        if split not in ("train", "validation") or (evidence is not None and split != "train"):
+            raise ValueError("Expected a frozen training or validation partition")
         self.root = Path(root)
         self.config = config
+        self.use_reference_boxes = use_reference_boxes
         base = self.root / "data/splits/ground_truth_v1"
         manifest = json.loads((base / "manifest.json").read_bytes())
-        body = (base / "train.jsonl").read_bytes()
-        if sha(body) != manifest["sha256"]["train"]:
-            raise ValueError("Pilot train manifest differs from its freeze hash")
+        body = (base / (split + ".jsonl")).read_bytes()
+        if sha(body) != manifest["sha256"][split]:
+            raise ValueError("Reviewed partition differs from its freeze hash")
+        self.allow_machine = permits_machine_training(base, self.root)
+        self.manifest_version = manifest["version"]
         self.train_sha256 = sha(body)
         self.rows = [json.loads(line) for line in body.splitlines()]
         self.xiaomi_sha256 = json.loads((self.root / "configs/xiaomi_provenance.json").read_bytes())["weight_sha256"]
@@ -143,9 +165,9 @@ class ReviewedPilot(Dataset):
     def __getitem__(self, i):
         row = self.rows[i]
         tid = row["table_id"]
-        gt = checked_json(self.root / row["gt"], row["gt_sha256"])
-        if (gt["table_id"], gt["reviewer_type"], gt["decision"]) != (tid, "human", "approve"):
-            raise ValueError("Expected a human-approved Pilot training sample")
+        gt = training_reference(dict(row, gt=self.root / row["gt"]), self.allow_machine)
+        if self.evidence is not None and gt["reviewer_type"] != "human":
+            raise ValueError("Smoke selection requires human-approved labels")
         packet = checked_json(self.root / "data/annotation/packets" / (tid + ".json"), gt["packet_sha256"])
         if packet["table_id"] != tid or packet["image_sha256"] != gt["image_sha256"]:
             raise ValueError("Pilot packet does not match the reviewed crop")
@@ -162,21 +184,28 @@ class ReviewedPilot(Dataset):
             page = json.loads(page_path.read_bytes()) if page_path.is_file() else None
         if page and (page["page_id"] != packet["page_id"] or page["document_sha256"] != packet["document_sha256"]):
             raise ValueError("Page geometry provenance mismatch")
-        all_boxes = crop_geometry(gt.get("structure_tree"), page, packet)
-        try:
-            raw_grid = parse(raw)
-        except ValueError:
-            raw_grid = None
+        tree = gt.get("structure_tree")
+        labels = reviewed_cell_targets(truth, tree, root_projection(page, packet))
         geometry = []
-        if raw_grid is not None:
+        if self.use_reference_boxes and tree is not None:
+            try:
+                raw_grid = parse(raw)
+            except ValueError:
+                raw_grid = None
             # Input boxes are projected only for OCR and reference cells that agree.
             matching = {(c.row, c.column, c.rowspan, c.colspan): c.text for c in truth.cells}
-            for c in raw_grid.cells:
+            all_boxes = {(c.row, c.column, c.rowspan, c.colspan): p["bbox"]
+                         for c, p in zip(truth.cells, labels["cells"], strict=True)}
+            for c in raw_grid.cells if raw_grid else ():
                 key = c.row, c.column, c.rowspan, c.colspan
                 bbox = all_boxes.get(key) if matching.get(key) == c.text else None
                 geometry.append(dict(bbox=bbox, source="ground_truth") if bbox is not None else None)
-        labels = cell_targets(truth, all_boxes)
-        labels["anomaly"] = float(raw != gt["corrected_otsl"])
+        if row.get("tier") != OCR_TIER:
+            labels["anomaly"] = float(raw != gt["corrected_otsl"])
+        if not self.use_reference_boxes:
+            raw_tokens, target_tokens = encode(raw), encode(gt["corrected_otsl"])
+            if len(raw_tokens) == len(target_tokens):
+                labels["repair_tokens"] = [b if a != b else None for a, b in zip(raw_tokens, target_tokens, strict=True)]
         return TableSample(tid, image_tensor(self.root / packet["image"], self.config.image_size, gt["image_sha256"]),
                            raw, gt["corrected_otsl"], geometry, supervision=labels)
 

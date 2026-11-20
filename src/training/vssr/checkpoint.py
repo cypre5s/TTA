@@ -6,7 +6,7 @@ from tempfile import NamedTemporaryFile
 
 import torch
 
-from .config import VSSRConfig
+from .config import VSSRConfig, config_digest
 from .model import build_model
 
 
@@ -31,7 +31,7 @@ def save_checkpoint(path, model, optimizer=None, step=0):
 def load_checkpoint(path, device="cpu", expected_config=None, expected_version=None):
     record = torch.load(path, map_location="cpu", weights_only=True)
     config = VSSRConfig(**record["config"])
-    if record["format_version"] != 1 or config.digest() != record["config_sha256"]:
+    if record["format_version"] != 1 or config_digest(record["config"]) != record["config_sha256"]:
         raise ValueError("Checkpoint format or configuration hash mismatch")
     if expected_config is not None and config.digest() != expected_config.digest():
         raise ValueError("Checkpoint does not match the expected config")

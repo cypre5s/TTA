@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+from html import escape
 import json
 from io import BytesIO
 from pathlib import Path
@@ -28,9 +29,18 @@ def render_otsl(text):
     try:
         return parse(text).html()
     except ValueError:
-        from html import escape
-
         return "<pre>" + escape(text) + "</pre>"
+
+
+def render_tree(tree):
+    rows = [[] for _ in range(tree["rows"])]
+    for cell in tree["cells"]:
+        row, span, width = (int(cell[k]) for k in ("row", "rowspan", "colspan"))
+        text = escape(cell["text"]).replace("\n", "<br>")
+        children = "".join(render_tree(child) for child in cell["children"])
+        html = f'<td rowspan="{span}" colspan="{width}">{text}{children}</td>'
+        rows[row].append(html)
+    return "<table>" + "".join("<tr>" + "".join(c) + "</tr>" for c in rows) + "</table>"
 
 
 def build(dataset, destination):
@@ -54,6 +64,7 @@ def build(dataset, destination):
         ):
             raise ValueError("Review evidence changed")
         corrected = reference["corrected_otsl"]
+        tree = reference.get("structure_tree")
         original = load(Path(packet["prediction"]))["raw_otsl"]
         records.append(
             dict(
@@ -62,7 +73,7 @@ def build(dataset, destination):
                 page=reference["page_number"],
                 image=preview(Path(row["image"])),
                 original=render_otsl(original),
-                corrected=parse(corrected).html(),
+                corrected=render_tree(tree) if tree else parse(corrected).html(),
                 changed=original != corrected,
                 quality=reference["visual_quality"],
                 flags=reference["flags"],
@@ -80,17 +91,20 @@ def build(dataset, destination):
 body{font:15px system-ui,sans-serif;color:#182532;margin:auto;max-width:1560px;padding:18px}
 header,nav{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button,select,input{font:inherit;padding:5px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.panel{border:1px solid #c4ccd4;padding:10px;overflow:auto}
-img{max-width:100%;max-height:60vh;object-fit:contain;object-position:top left}table{border-collapse:collapse;min-width:100%}
+img{max-width:100%;max-height:60vh;object-fit:contain;object-position:top left}
+img.zoomed{max-width:none;max-height:none}table{border-collapse:collapse;min-width:100%}
 td{border:1px solid #687685;padding:4px;vertical-align:top}.meta{overflow-wrap:anywhere;line-height:1.55}.changed{color:#9b3d16}
 @media(max-width:850px){.grid{grid-template-columns:1fr}}
 </style><header><h1>5k 测试集逐项复核</h1><button id="prev">上一项</button><button id="next">下一项</button>
 <label>跳转 <select id="pick"></select></label><label><input id="seen" type="checkbox">已查看</label><span id="pos"></span></header>
-<p id="scope"></p><p class="meta" id="meta"></p><div class="grid"><section class="panel"><h2>原始裁片</h2><img id="image"></section>
+<p id="scope"></p><p class="meta" id="meta"></p><div class="grid"><section class="panel"><h2>原始裁片</h2>
+<button id="zoom" aria-pressed="false">放大裁片</button><div><img id="image" alt="表格原始裁片"></div></section>
 <section class="panel"><h2>最终结构</h2><div id="corrected"></div></section><section class="panel"><h2>原始 OCR 结构</h2><div id="original"></div></section>
 <section class="panel"><h2>审核记录</h2><pre id="flags"></pre></section></div>
 <script id="records" type="application/json">PAYLOAD</script><script>
 const rows=JSON.parse(document.querySelector('#records').textContent), el=id=>document.getElementById(id), pick=el('pick');
-const key='tender-5k-reviewed-SOURCE_HASH', viewed=new Set(JSON.parse(localStorage.getItem(key)||'[]'));let i=0;
+const key='tender-5k-reviewed-SOURCE_HASH';let persisted=[];
+try{persisted=JSON.parse(localStorage.getItem(key)||'[]')}catch{}const viewed=new Set(persisted);let i=0;
 rows.forEach((r,n)=>pick.add(new Option('第 '+r.ordinal+' 项',n)));
 function show(n){i=Math.max(0,Math.min(rows.length-1,n));const r=rows[i];pick.value=i;el('pos').textContent=(i+1)+' / '+rows.length;
 el('image').src='data:image/webp;base64,'+r.image;el('corrected').innerHTML=r.corrected;el('original').innerHTML=r.original;
@@ -98,8 +112,9 @@ el('flags').textContent=JSON.stringify(r.flags,null,2);el('meta').innerHTML='编
   ' · 质量 '+r.quality+' · 处理 '+r.action+(r.changed?' · <span class="changed">结构或文字已修正</span>':' · 保留原识别')+
   '<br>图像 '+r.image_sha256+'<br>参考 '+r.reference_sha256;el('seen').checked=viewed.has(r.table_id)}
 el('prev').onclick=()=>show(i-1);el('next').onclick=()=>show(i+1);pick.onchange=()=>show(+pick.value);
-el('seen').onchange=()=>{const id=rows[i].table_id;if(el('seen').checked)viewed.add(id);else viewed.delete(id);localStorage.setItem(key,JSON.stringify([...viewed]));};
-el('scope').textContent='只包含新扩量中进入测试集的机器辅助参考，共 '+rows.length+' 项。清单 SHA256 SOURCE_HASH。';show(0);
+el('seen').onchange=()=>{const id=rows[i].table_id;if(el('seen').checked)viewed.add(id);else viewed.delete(id);try{localStorage.setItem(key,JSON.stringify([...viewed]))}catch{}};
+el('zoom').onclick=()=>{const on=el('image').classList.toggle('zoomed');el('zoom').setAttribute('aria-pressed',on);el('zoom').textContent=on?'适应窗口':'放大裁片'};
+el('scope').textContent='只包含新扩量中进入测试集的机器辅助参考，共 '+rows.length+' 项。清单 SHA256 SOURCE_HASH。';if(rows.length)show(0);
 </script></html>"""
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(

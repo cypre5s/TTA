@@ -26,6 +26,7 @@ class VSSRConfig:
     cell_queries: int = 128
     nested_queries: int = 8
     child_queries: int = 24
+    max_nesting_depth: int = 1
     freeze_backbone: bool = True
     unfreeze_last_stage: bool = False
     proposal_threshold: float = 0.5
@@ -46,6 +47,8 @@ class VSSRConfig:
         )
         if min(sizes) < 1 or self.hidden % self.heads or len(self.visual_pools) != 4:
             raise ValueError("Invalid VSSR widths, heads, sequence limits or pyramid pools")
+        if self.max_nesting_depth not in (1, 2):
+            raise ValueError("VSSR supports one or two nested table levels")
         if not 0 <= self.dropout < 1 or not all(
             0 < x < 1 for x in (self.proposal_threshold, self.abstain_threshold)
         ):
@@ -62,5 +65,9 @@ class VSSRConfig:
         return asdict(self)
 
     def digest(self):
-        body = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":")).encode()
-        return hashlib.sha256(body).hexdigest()
+        return config_digest(self.as_dict())
+
+
+def config_digest(values):
+    body = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()

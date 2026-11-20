@@ -27,7 +27,10 @@ class HierarchyDecoder(nn.Module):
         self.child_relations = RelationDecoder(d)
 
     def forward(self, fused, proposal):
-        parents = proposal["cell_embeddings"]
+        return self.decode_level(fused["visual"], proposal["cell_embeddings"])
+
+    def decode_level(self, vision, parents):
+        """Return region boxes in the same local coordinate frame as the parents."""
         b, _, d = parents.shape
         nested = self.decode(self.queries.weight[None].expand(b, -1, -1), parents)
         association = torch.bmm(self.parent_query(nested), self.parent_key(parents).transpose(1, 2)) / d**0.5
@@ -37,7 +40,6 @@ class HierarchyDecoder(nn.Module):
         n = base.shape[1]
         child = base[:, :, None] + self.child_queries.weight[None, None].to(base.dtype)
         flat = child.flatten(1, 2)
-        vision = fused["visual"]
         flat = self.child_norm(flat + self.child_visual(flat, vision, vision, need_weights=False)[0])
         child = flat.reshape(b, n, -1, d)
         exists = self.exists(base).squeeze(-1)

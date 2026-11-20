@@ -13,5 +13,6 @@ max_cells: 512
 cell_queries: 128
 nested_queries: 8
 child_queries: 24
+max_nesting_depth: 2
 freeze_backbone: true
 unfreeze_last_stage: false

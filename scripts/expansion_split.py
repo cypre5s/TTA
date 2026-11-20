@@ -4,16 +4,20 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import tempfile
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 from scripts.evaluate import read_split
-from scripts.expansion_quality import EXP, OUT, fingerprint
+from scripts.expansion_quality import EXP, OUT, fingerprint, screen
 from scripts.ground_truth import immutable, jbytes, sha
+from scripts.training_reference import OCR_TIER, VISUAL_TIER
 from src.otsl.grid import parse
 
 PILOT = Path("data/splits/ground_truth_v1")
 TARGETS = {"train": 3500, "validation": 750, "test": 750}
+REFERENCE_PRIORITY = {"human": 0, VISUAL_TIER: 1, OCR_TIER: 2}
 
 
 def group_map():
@@ -89,13 +93,19 @@ def choose(refs, assignment):
     groups = defaultdict(list)
     exposure = {"train": 0, "validation": 1, "test": 2}
     for signature, options in refs.items():
+        prior = [o for o in options if o["tier"] == "human"]
+        if prior:
+            # Keep the earliest prior exposure even when that project's groups
+            # merged and the original row became ineligible for this release.
+            partition = min((o["pilot_partition"] for o in prior), key=exposure.get)
+            options = [o for o in prior if o["pilot_partition"] == partition]
         options = [o for o in options if len(assignment[o["group_id"]]) < 2]
         if options:
             # A signature appears exactly once in the final corpus. Prefer its human-reviewed reference.
             ref = min(
                 options,
                 key=lambda o: (
-                    o["tier"] != "human",
+                    REFERENCE_PRIORITY[o["tier"]],
                     exposure.get(o.get("pilot_partition"), 3),
                     o["table_id"],
                 ),
@@ -116,7 +126,7 @@ def choose(refs, assignment):
         # A corpus larger than 5k supplies reserves for each project-isolated partition.
         bins[split].sort(
             key=lambda r: (
-                r["tier"] != "human",
+                REFERENCE_PRIORITY[r["tier"]],
                 hashlib.sha256(("42" + r["table_id"]).encode()).digest(),
             )
         )
@@ -149,8 +159,13 @@ def verify_usable(row):
         raise ValueError("Invalid pilot decision")
     if not pilot:
         rev = EXP / "annotation/raw" / packet.name
-        if gt["decision"] != "usable" or sha(rev.read_bytes()) != gt["review_sha256"]:
+        if gt["decision"] != "usable" or gt["label_tier"] != row["tier"]:
             raise ValueError("Invalid expansion review")
+        if row["tier"] == OCR_TIER:
+            if screen(packet) != gt:
+                raise ValueError("Original OCR structure screen changed")
+        elif row["tier"] != VISUAL_TIER or sha(rev.read_bytes()) != gt["review_sha256"]:
+            raise ValueError("Changed visual review")
     img = Path(meta["image"])
     if (
         sha(img.read_bytes()) != gt["image_sha256"]
@@ -176,30 +191,11 @@ def verify_usable(row):
     )
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--publish-for-review", action="store_true")
-    ap.add_argument("--output", type=Path, default=EXP / "review_5k")
-    args = ap.parse_args()
-    refs, assignment = inventory()
-    splits = choose(refs, assignment)
-    sizes = {k: len(splits[k]) for k in TARGETS}
-    tiers = {k: dict(Counter(r["tier"] for r in splits[k])) for k in TARGETS}
-    print(
-        json.dumps(
-            dict(distinct=len(refs), partitions=sizes, tiers=tiers), ensure_ascii=False
-        ),
-        flush=True,
-    )
-    if not args.publish_for_review:
-        return
-    if sizes != TARGETS:
-        raise ValueError(
-            "Insufficient unique records to fill the project-isolated 5k cohort"
-        )
+def prepare(output, staged, splits, tiers):
     seen = set()
     seen_groups = set()
-    hashes = {}
+    contents = {}
+    hard = []
     for k, rows in splits.items():
         sigs = {r["signature"] for r in rows}
         groups = {r["group_id"] for r in rows}
@@ -207,28 +203,74 @@ def main():
             raise ValueError("Project or content overlap")
         seen.update(sigs)
         seen_groups.update(groups)
-        rows[:] = [verify_usable(r) for r in rows]
-        buf = b"".join(jbytes(r) for r in rows)
-        immutable(args.output / (k + ".jsonl"), buf)
-        hashes[k] = sha(buf)
-    buf = b"".join(jbytes(r) for r in splits["test"] if r["hard"])
-    immutable(args.output / "hard_test.jsonl", buf)
-    hashes["hard_test"] = sha(buf)
-    immutable(
-        args.output / "manifest.json",
-        jbytes(
-            dict(
-                version="expansion_5k_review_v1",
-                status="prepared_for_review",
-                sizes=sizes,
-                tiers=tiers,
-                sha256=hashes,
-                project_groups=len(seen_groups),
-                pilot_embargo="prior projects kept in their previous partition; merged conflicting groups excluded",
-                machine_labels_require_human_evaluation_clearance=True,
-            )
-        ),
+        checked = [verify_usable(r) for r in rows]
+        for row in checked:
+            body = Path(row["reference"]).read_bytes()
+            if sha(body) != row["reference_sha256"]:
+                raise ValueError("Reference changed during publication")
+            alias = Path("references", row["table_id"] + ".json")
+            immutable(staged / alias, body)
+            row["reference"] = str(output / alias)
+        contents[k] = b"".join(jbytes(r) for r in checked)
+        if k == "test":
+            hard = [r for r in checked if r["hard"]]
+    if not hard:
+        raise ValueError("Empty hard-test subset")
+    contents["hard_test"] = b"".join(jbytes(r) for r in hard)
+    manifest = dict(
+        version="expansion_5k_review_v1",
+        status="prepared_for_review",
+        sizes=TARGETS,
+        tiers=tiers,
+        sha256={k: sha(v) for k, v in contents.items()},
+        project_groups=len(seen_groups),
+        pilot_embargo="prior projects kept in their previous partition; merged conflicting groups excluded",
+        machine_labels_require_human_evaluation_clearance=True,
     )
+    for name, body in contents.items():
+        immutable(staged / (name + ".jsonl"), body)
+    immutable(staged / "manifest.json", jbytes(manifest))
+
+
+def publish(output, splits, tiers):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix=".5k-review-") as tmp:
+        staged = Path(tmp, "prepared")
+        prepare(output, staged, splits, tiers)
+        staged.rename(output)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--publish-for-review", action="store_true")
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--output", type=Path, default=EXP / "review_5k")
+    args = ap.parse_args()
+    if args.watch and not args.publish_for_review:
+        ap.error("--watch requires --publish-for-review")
+    while True:
+        if args.publish_for_review and args.output.exists():
+            manifest = json.loads((args.output / "manifest.json").read_bytes())
+            sizes = {name: len(read_split(args.output, name)) for name in TARGETS}
+            if manifest["status"] != "prepared_for_review" or sizes != TARGETS:
+                raise ValueError("Existing review directory is not a complete 5k cohort")
+            read_split(args.output, "hard_test")
+            print("Verified existing review cohort", args.output, flush=True)
+            return
+        refs, assignment = inventory()
+        splits = choose(refs, assignment)
+        sizes = {k: len(splits[k]) for k in TARGETS}
+        tiers = {k: dict(Counter(r["tier"] for r in splits[k])) for k in TARGETS}
+        print(jbytes(dict(distinct=len(refs), partitions=sizes, tiers=tiers)).decode().strip(),
+              flush=True)
+        if not args.publish_for_review:
+            return
+        if sizes == TARGETS:
+            publish(args.output, splits, tiers)
+            return
+        if not args.watch:
+            raise ValueError("Insufficient unique records to fill the project-isolated 5k cohort")
+        time.sleep(30)
 
 
 if __name__ == "__main__":

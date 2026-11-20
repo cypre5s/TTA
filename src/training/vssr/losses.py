@@ -32,7 +32,8 @@ def localization(boxes, expected):
 
 def set_losses(exists, boxes, types, cells, relation_logits, relation_target):
     target, box_ok, cls, cls_ok = positive_targets(cells, boxes.device)
-    pi, ti = hungarian(exists, boxes, types, target, box_ok, cls, cls_ok)
+    has_boxes = any(c.get("bbox") is not None for c in cells)
+    pi, ti = hungarian(exists, boxes, types, target, box_ok, cls, cls_ok, has_boxes=has_boxes)
     object_target = torch.zeros_like(exists)
     object_target[pi] = 1
     cell = binary(exists, object_target)
@@ -41,7 +42,7 @@ def set_losses(exists, boxes, types, cells, relation_logits, relation_target):
     if cls_ok[ti].any():
         yes = cls_ok[ti]
         cell = cell + F.cross_entropy(types[pi[yes]].float(), cls[ti[yes]])
-    if box_ok[ti].any():
+    if has_boxes and box_ok[ti].any():
         yes = box_ok[ti]
         bbox = localization(boxes[pi[yes]], target[ti[yes]])
     if relation_target is not None and len(pi) > 1:
@@ -50,39 +51,52 @@ def set_losses(exists, boxes, types, cells, relation_logits, relation_target):
         valid = off_diag[..., None] & (expected >= 0)
         if valid.any():
             relation = binary(relation_logits[pi][:, pi][valid], expected[valid])
-    return dict(cell=cell, bbox=bbox, relation=relation), dict(zip(ti.tolist(), pi.tolist())), target[box_ok]
+    return (dict(cell=cell, bbox=bbox, relation=relation), dict(zip(ti.tolist(), pi.tolist())),
+            target[box_ok] if has_boxes else target[:0])
 
 
-def hierarchy_loss(out, i, children, parent_match):
-    output_box = out["nested_region"][i]
-    parent_logits = out["parent_logits"][i]
-    existence = out["nested_logits"][i]
+def hierarchy_loss(out, children, parent_match, parent_boxes, descend=None, visual=None, levels=1):
+    output_box = out["nested_region"]
+    parent_logits = out["parent_logits"]
+    existence = out["nested_logits"]
     targets, box_ok, _, _ = positive_targets(children, output_box.device)
     parents = [parent_match.get(c["parent"]) for c in children]
     parent_ok = torch.tensor([p is not None for p in parents], device=output_box.device, dtype=torch.bool)
     parent_ids = torch.tensor([p if p is not None else 0 for p in parents], device=output_box.device, dtype=torch.long)
-    pi, ti = hungarian(existence, output_box, parent_logits, targets, box_ok, parent_ids, parent_ok)
+    has_boxes = any(child.get("bbox") is not None for child in children)
+    pi, ti = hungarian(existence, output_box, parent_logits, targets, box_ok, parent_ids, parent_ok, has_boxes=has_boxes)
     positive = torch.zeros_like(existence)
     positive[pi] = 1
     terms = [binary(existence, positive)]
-    if box_ok[ti].any():
+    if has_boxes and box_ok[ti].any():
         mask = box_ok[ti]
         terms.append(localization(output_box[pi[mask]], targets[ti[mask]]))
     if parent_ok[ti].any():
         mask = parent_ok[ti]
         indices, matched = pi[mask], parent_ids[ti[mask]]
         terms.append(F.cross_entropy(parent_logits[indices].float(), matched))
-        parent = out["cell_boxes"][i, matched].float()
+        parent = parent_boxes[matched].float()
         region = output_box[indices].float()
         terms.append((F.relu(parent[:, :2] - region[:, :2]) + F.relu(region[:, 2:] - parent[:, 2:])).mean())
+    branches = []
     for p, t in zip(pi.tolist(), ti.tolist(), strict=True):
         child = children[t]
+        child_match = {}
         if child.get("cells") is not None:
-            child_terms, _, _ = set_losses(
-                out["child_cell_logits"][i, p], out["child_boxes"][i, p], out["child_type_logits"][i, p],
-                child["cells"], out["child_relation_logits"][i, p], child.get("relations"),
+            child_terms, child_match, _ = set_losses(
+                out["child_cell_logits"][p], out["child_boxes"][p], out["child_type_logits"][p],
+                child["cells"], out["child_relation_logits"][p], child.get("relations"),
             )
             terms.append(sum(child_terms.values()))
+        if levels > 1 and child.get("nested") is not None:
+            branches.append((p, child["nested"], child_match))
+    if branches:
+        if descend is None:
+            raise ValueError("Nested targets beyond depth one require the hierarchy decoder")
+        indices = [p for p, _, _ in branches]
+        deeper = descend(visual.expand(len(branches), -1, -1), out["child_embeddings"][indices])
+        for j, (p, targets, match) in enumerate(branches):
+            terms.append(hierarchy_loss({k: v[j] for k, v in deeper.items()}, targets, match, out["child_boxes"][p]))
     return torch.stack(terms).mean()
 
 
@@ -114,7 +128,7 @@ def supervised_anomaly(out, batch, i, labels):
     return terms
 
 
-def compute_losses(out, batch, config):
+def compute_losses(out, batch, config, descend=None):
     terms = defaultdict(list)
     zero = out["anomaly_logits"].float().sum() * 0
     for i, labels in enumerate(batch["targets"]):
@@ -144,7 +158,12 @@ def compute_losses(out, batch, config):
         terms["constraint"].append(sum(constraints.values()))
         children = labels.get("nested")
         if "nested_logits" in out and children is not None:
-            terms["hierarchy"].append(hierarchy_loss(out, i, children, match))
+            names = ("nested_region", "parent_logits", "nested_logits", "child_cell_logits", "child_boxes",
+                     "child_type_logits", "child_relation_logits", "child_embeddings")
+            terms["hierarchy"].append(hierarchy_loss(
+                {name: out[name][i] for name in names}, children, match, out["cell_boxes"][i],
+                descend, out["features"]["visual"][i:i + 1], config.max_nesting_depth,
+            ))
         repair = labels.get("repair_tokens")
         if repair is not None:
             logits = out["repair_logits"][i]
