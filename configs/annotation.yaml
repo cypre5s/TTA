@@ -1,0 +1,4 @@
+schema: configs/annotation.schema.json
+packets: data/annotation/packets
+responses: data/annotation/raw
+human_review_status: pending

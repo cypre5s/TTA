@@ -1,0 +1,5 @@
+target: 200
+delay: 2.0
+site: 中国劳动关系学院资产管理处
+base: https://news.culr.edu.cn/zcglc/
+channels: [cgjg]

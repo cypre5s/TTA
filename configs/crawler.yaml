@@ -1,0 +1,5 @@
+target: 200
+delay: 2.0
+site: 华北电力大学资产与实验室管理处
+base: https://zcc.ncepu.edu.cn/
+channels: [fwcggg, hwcggg, gccggg, zbgs, zbgg]

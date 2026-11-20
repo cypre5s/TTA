@@ -1,0 +1,5 @@
+dpi: 200
+complex_dpi: 300
+# Vector grid line count is only a rendering-resolution heuristic.
+complex_grid_lines: 26
+workers: 3

@@ -1,0 +1,7 @@
+table_metric: IBM PubTabNet TEDS
+upstream_revision: 7b03ef8f54f747fa3accf7b9354520a41b30ab40
+normalization: Strict OTSL parse, escape cell text, row-major, strip outer cell whitespace
+averaging: Macro by table for TEDS, TEDS-S and exact rates; micro for cell geometry and CER
+missing_predictions: score zero for structural comparisons
+cell_match: Exact row, column, rowspan, colspan
+test_policy: require frozen experiment and metric hashes

@@ -1,0 +1,16 @@
+layout:
+  framework: PaddleX
+  model: PP-DocLayoutV3
+  num_classes: 25
+  check_dataset_first: true
+xiaomi_probe:
+  lora_rank: 8
+  micro_batch_size: 1
+  input_partition: train
+repair:
+  architecture: Transformer encoder-decoder
+  width: 96
+  layers: 2
+  max_tokens: 1536
+  epochs: 3
+  learning_rate: 0.0002

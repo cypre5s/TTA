@@ -1,0 +1,10 @@
+provider: codex_subagent
+model: gpt-6-luna
+stages: [10, 100, 1000]
+max_concurrency: 2
+human_review_status: pending
+reviewers:
+  - {agent: /root/visual_a, first: 1, last: 10, step: 1}
+  - {agent: /root/visual_a, first: 12, last: 1000, step: 2}
+  - {agent: /root/visual_b, first: 11, last: 897, step: 2}
+  - {agent: /root/visual_a, first: 899, last: 999, step: 2}

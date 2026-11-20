@@ -1,0 +1,6 @@
+target: 200
+delay: 2.0
+site: 北京市公共资源交易服务平台
+base: https://ggzyfw.beijing.gov.cn/
+channels: [xmcgzbjj]
+article_pattern: '/xmcgzbjj/[0-9]{8}/[0-9]+\.html'

@@ -1,0 +1,8 @@
+B0: 原始版面及裁剪识别
+B0-E2E: 原始 Xiaomi 整页识别
+B1: 微调版面及原始 OCR
+B2: 原始版面及微调 OCR
+B3: 微调版面及微调 OCR
+B4: B0 加 OTSL 修复
+B5: B1 加 OTSL 修复
+B6: B3 加 OTSL 修复

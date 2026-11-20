@@ -1,0 +1,8 @@
+model: PP-DocLayoutV3
+model_dir: ../TenderDoc-AI/models/layout/PP-DocLayoutV3
+device: "gpu:0"
+threshold: 0.25
+target_tables: 1000
+target_documents: 200
+full_pilot_pages: true
+pipeline_io: true

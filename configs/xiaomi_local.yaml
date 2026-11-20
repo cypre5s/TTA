@@ -1,0 +1,10 @@
+model: Xiaomi-OCR-0
+checkpoint: ../TDA/assets/Xiaomi-OCR-0
+upstream: ../TDA/assets/upstream
+prompt: Parse the table in the image into OTSL.
+max_new_tokens: 4096
+batch_size: 8
+runtime_variant: original+hybrid
+gpu_memory_fraction: 0.68
+min_free_mib: 6200
+bucket_by_length: false

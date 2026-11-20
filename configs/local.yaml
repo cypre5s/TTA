@@ -1,0 +1,3 @@
+database: database/pilot.sqlite
+pdf_root: data/raw/pdf
+render_root: data/rendered

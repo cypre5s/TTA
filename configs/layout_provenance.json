@@ -1,0 +1,37 @@
+{
+  "model": "PP-DocLayoutV3",
+  "category_mapping": {
+    "0": "abstract",
+    "1": "algorithm",
+    "2": "aside_text",
+    "3": "chart",
+    "4": "content",
+    "5": "display_formula",
+    "6": "doc_title",
+    "7": "figure_title",
+    "8": "footer",
+    "9": "footer_image",
+    "10": "footnote",
+    "11": "formula_number",
+    "12": "header",
+    "13": "header_image",
+    "14": "image",
+    "15": "inline_formula",
+    "16": "number",
+    "17": "paragraph_title",
+    "18": "reference",
+    "19": "reference_content",
+    "20": "seal",
+    "21": "table",
+    "22": "text",
+    "23": "vertical_text",
+    "24": "vision_footnote"
+  },
+  "files": {
+    "inference.json": "2b68367c5b312a03de5a6e1642c597c8f95165a7e40cd59c6700cf4a5042f4fd",
+    "inference.yml": "506fcfac13b3b546ae40d7886b44126420f392adb694e3f8bb6a6286a1f90fdc",
+    "inference.pdiparams": "70bd316b0582769ec968829fd1feb1a6a58b7c941b938327e551b6b12b45c137"
+  },
+  "repo": "PaddlePaddle/PP-DocLayoutV3",
+  "revision": "241f8bdfc77a7c7bee915a5057aaee58c235a8d3"
+}

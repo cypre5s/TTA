@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+.cache/
+__pycache__/
+*.pyc
+data/
+models/
+logs/
+database/
+experiments/
+reports/
+.ruff_cache/
