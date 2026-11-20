@@ -30,7 +30,8 @@ split-reviewed:
 check-layout-dataset train-layout:
 	@$(or $(PADDLE_PYTHON),.venv/bin/python) -m scripts.future_training layout --paddlex "$(PADDLEX)" --dataset "$(DATASET)" --output "$(OUTPUT)" $(if $(filter train-layout,$@),--train --weights "$(WEIGHTS)",)
 check-xiaomi-finetune:
-	@$(or $(XIAOMI_PYTHON),../TDA/.venv/bin/python) -m scripts.future_training xiaomi-probe --rank "$(or $(RANK),8)" --model ../TDA/assets/Xiaomi-OCR-0 --dataset "$(DATASET)" --output "$(OUTPUT)"
+	@echo 'Xiaomi LoRA 已归入历史档案。当前研究主线使用原始 BF16 Xiaomi 和 VSSR。' >&2
+	@false
 train-repair:
 	@$(or $(TORCH_PYTHON),../TDA/.venv/bin/python) -m src.training.repair train --dataset "$(DATASET)" --output "$(OUTPUT)" --device "$(or $(DEVICE),cpu)"
 predict-repair:
@@ -46,9 +47,17 @@ baseline: PREDICTIONS ?= data/tables/predictions
 baseline: evaluate
 freeze-evaluation:
 	@.venv/bin/python -m scripts.evaluate freeze --dataset "$(DATASET)" --config "$(CONFIG)" --predictions "$(PREDICTIONS)" --output "$(OUTPUT)" --freeze "$(FREEZE)" --split "$(or $(SPLIT),validation)"
-train-xiaomi:
-	@$(or $(XIAOMI_PYTHON),../TDA/.venv/bin/python) -m scripts.future_training xiaomi-train --model ../TDA/assets/Xiaomi-OCR-0 --dataset "$(DATASET)" --output "$(OUTPUT)" --probe "$(PROBE)" --rank "$(or $(RANK),8)" --epochs "$(or $(EPOCHS),1)" --accumulation "$(or $(ACCUMULATION),8)"
+train-xiaomi: check-xiaomi-finetune
 
 .PHONY: setup-layout-gpu
 setup-layout-gpu:
 	@scripts/setup_layout_gpu.sh
+
+.PHONY: test-vssr check-repvit smoke-vssr
+VSSR_PYTHON ?= ../TDA/.venv/bin/python
+test-vssr:
+	@$(VSSR_PYTHON) -m unittest discover -s tests/vssr -v
+check-repvit:
+	@$(VSSR_PYTHON) -m scripts.check_repvit $(VSSR_ARGS)
+smoke-vssr:
+	@$(VSSR_PYTHON) -m scripts.smoke_vssr_all $(VSSR_ARGS)

@@ -1,0 +1,17 @@
+backbone: repvit_m1_0.dist_450e_in1k
+backbone_revision: 0e20f9f1bfa9772e63b813835bab2d6f0d168f89
+image_size: 1024
+hidden: 256
+heads: 8
+structure_layers: 4
+structure_ffn: 1024
+fusion_layers: 2
+dropout: 0.1
+visual_pools: [12, 8, 4, 2]
+max_tokens: 2048
+max_cells: 512
+cell_queries: 128
+nested_queries: 8
+child_queries: 24
+freeze_backbone: true
+unfreeze_last_stage: false

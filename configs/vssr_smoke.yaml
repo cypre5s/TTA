@@ -1,0 +1,5 @@
+backbone: repvit_m1_0.dist_450e_in1k
+image_size: 1024
+max_tokens: 1024
+max_cells: 256
+freeze_backbone: true
